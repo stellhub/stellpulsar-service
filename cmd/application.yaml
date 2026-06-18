@@ -1,0 +1,117 @@
+app:
+  name: stellpulsar-service
+  env: dev
+  zone: local
+  version: dev
+
+http:
+  server:
+    enabled: true
+    port: 19092
+    adapter: gin
+    observability:
+      trace: true
+      metrics: true
+      logs: true
+
+grpc:
+  server:
+    enabled: true
+    port: 19093
+    adapter: grpc-go
+    observability:
+      trace: true
+      metrics: true
+      logs: true
+  client:
+    enabled: true
+    timeout: 3s
+    insecure: true
+    observability:
+      trace: true
+      metrics: true
+      logs: true
+    clients:
+      stellpulsar-self:
+        target: dns:///127.0.0.1:19093
+        timeout: 2s
+
+cache:
+  enabled: true
+  adapter: bigcache
+  ttl: 30m
+  clean_window: 1m
+  shards: 1024
+  hard_max_cache_size_mb: 128
+  size_bytes: 134217728
+  debug_api:
+    enabled: false
+    prefix: /cache
+  observability:
+    trace: true
+    metrics: true
+    logs: true
+
+registry:
+  enabled: true
+  adapter: stellmap
+  endpoints:
+    - http://localhost:18090
+  namespace: default
+  service: stellpulsar-service
+  instance_id: stellpulsar-service-local-1
+  zone: local
+  ttl: 30s
+  heartbeat_interval: 10s
+  labels:
+    env: dev
+    component: rate-limit-server
+  metadata:
+    version: dev
+    priority: "100"
+    weight: "100"
+  service_endpoints:
+    - name: grpc
+      protocol: grpc
+      host: 127.0.0.1
+      port: 19093
+      weight: 100
+
+stellpulsar:
+  grpc:
+    client_name: stellpulsar-self
+  instance:
+    priority: 100
+    weight: 100
+  observability:
+    topology_metrics: true
+  stellorbit:
+    runtime_endpoint: http://localhost:8080
+    http_timeout: 5s
+    auth_token: ""
+  rules:
+    snapshot_page_size: 100
+    watch_reconnect_delay: 500ms
+    watch_resync_interval: 30s
+    delta_fetch_timeout: 3s
+    full_sync_max_retries: 3
+    watch_event_buffer: 64
+    server_lag_retry_after: 50ms
+    bucket_gc_interval: 30s
+    expired_bucket_grace: 2m
+    max_buckets: 1000000
+    compatible_previous_revision: 5s
+    session_heartbeat_interval: 10s
+    allow_empty_startup: true
+  security:
+    auth_token: ""
+
+opentelemetry:
+  log:
+    enabled: false
+    output: stdout
+  trace: false
+  metrics: true
+  metrics_output: prometheus
+  metrics_path: /metrics
+  trace_output: none

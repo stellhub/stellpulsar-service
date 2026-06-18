@@ -1,0 +1,583 @@
+syntax = "proto3";
+
+// StellPulsar 客户端与服务端交互协议。
+//
+// 协议目标：
+// 1. 客户端首次启动时获取所有可用 StellPulsar 服务端实例。
+// 2. 客户端按实例优先级和固定哈希选择目标服务端。
+// 3. 客户端与目标服务端建立双向流，用于心跳和规则水位同步。
+// 4. 客户端请求配额时携带本地规则版本和 checksum，服务端据此校验双方规则是否一致。
+// 5. 客户端可以按需获取服务端规则快照，并校验配置中心下发规则与服务端内存规则是否一致。
+package stellpulsar.v1;
+
+option go_package = "github.com/stellhub/stellpulsar-service/api/stellpulsar/v1;stellpulsarv1";
+
+// StellPulsarDiscoveryService 提供客户端启动阶段的服务端实例发现能力。
+//
+// 客户端先调用 ListInstances 获取当前所有可用 StellPulsar 节点，
+// 再根据 priority、weight、instance_id 和本地 hash key 固定选择连接目标。
+service StellPulsarDiscoveryService {
+  // ListInstances 返回所有可被客户端连接的 StellPulsar 服务端实例。
+  //
+  // 返回结果应按 priority 升序排列，同优先级内再按健康状态、weight 和 instance_id 稳定排序。
+  // 客户端需要缓存 instance_revision，并在过期或连接失败时重新拉取实例列表。
+  rpc ListInstances(ListInstancesRequest) returns (ListInstancesResponse);
+}
+
+// StellPulsarRuntimeService 提供分布式限流运行期能力。
+//
+// OpenSession 用于维护长连接和规则水位同步；
+// AcquireQuota 用于实时获取限流配额；
+// GetRuleSnapshot 和 ValidateRuleSnapshot 用于排查或修复客户端与服务端规则不一致。
+service StellPulsarRuntimeService {
+  // OpenSession 建立客户端和单个 StellPulsar 服务端之间的 gRPC 双向流。
+  //
+  // 客户端应在固定哈希选中目标实例后调用该接口，并在流内发送 hello、heartbeat、rule_digest、ack。
+  // 服务端通过该流返回 hello、heartbeat、rule_changed、drain 和 error。
+  rpc OpenSession(stream ClientFrame) returns (stream ServerFrame);
+
+  // AcquireQuota 根据服务端内存中的限流规则执行配额扣减。
+  //
+  // 客户端必须携带 rule_revision 和 rule_checksum。
+  // 如果客户端规则和服务端规则不一致，服务端优先返回规则状态类 decision，不执行扣减。
+  rpc AcquireQuota(AcquireQuotaRequest) returns (AcquireQuotaResponse);
+
+  // GetRuleSnapshot 返回服务端当前内存中的限流规则快照。
+  //
+  // 客户端一般不在热路径频繁调用该接口，只在规则不一致、启动校验或诊断时使用。
+  rpc GetRuleSnapshot(GetRuleSnapshotRequest) returns (GetRuleSnapshotResponse);
+
+  // ValidateRuleSnapshot 校验客户端持有的规则 digest 是否与服务端一致。
+  //
+  // 该接口只比较 rule_id、revision、checksum、schema_version 等轻量字段，
+  // 适合客户端在收到 RULE_CONFLICT、RULE_STALE 或长连接 rule_changed 后快速确认差异。
+  rpc ValidateRuleSnapshot(ValidateRuleSnapshotRequest) returns (ValidateRuleSnapshotResponse);
+}
+
+// ListInstancesRequest 是客户端发现 StellPulsar 服务端实例的请求。
+message ListInstancesRequest {
+  // namespace 是注册中心命名空间，例如 default、dev、prod。
+  string namespace = 1;
+
+  // application_code 是当前业务应用编码，用于服务端按应用做灰度、隔离或标签过滤。
+  string application_code = 2;
+
+  // client_id 是客户端进程或 SDK 实例 ID，可参与固定哈希和诊断。
+  string client_id = 3;
+
+  // supported_protocol_versions 是客户端支持的协议版本列表。
+  // 服务端可据此选择兼容版本，当前默认使用 stellpulsar.v1。
+  repeated string supported_protocol_versions = 4;
+
+  // labels 是客户端侧的可选标签，例如 region、zone、env、tenant。
+  // 服务端可以用它做实例筛选或返回更适合的优先级结果。
+  map<string, string> labels = 5;
+}
+
+// ListInstancesResponse 是可用 StellPulsar 服务端实例列表。
+message ListInstancesResponse {
+  // protocol_version 是服务端选择的协议版本。
+  string protocol_version = 1;
+
+  // instance_revision 是本次实例列表的版本水位，也作为 topology_revision 使用。
+  // 客户端必须使用该值参与 owner 计算，并在 AcquireQuotaRequest 中原样携带。
+  string instance_revision = 2;
+
+  // expires_at_unix_ms 是实例列表缓存过期时间，Unix 毫秒。
+  int64 expires_at_unix_ms = 3;
+
+  // instances 是按优先级排序后的服务端实例列表。
+  repeated PulsarInstance instances = 4;
+
+  // hash_algorithm 是客户端和服务端共同使用的 owner 计算算法。
+  // 首版固定为 rendezvous_hash_v1，客户端必须按该算法计算 quota shard owner。
+  string hash_algorithm = 5;
+}
+
+// PulsarInstance 描述一个可被客户端连接的 StellPulsar 服务端实例。
+message PulsarInstance {
+  // instance_id 是服务端实例唯一 ID。
+  string instance_id = 1;
+
+  // host 是客户端访问 gRPC 服务的主机名或 IP。
+  string host = 2;
+
+  // port 是客户端访问 gRPC 服务的端口。
+  int32 port = 3;
+
+  // priority 是实例优先级，数值越小优先级越高。
+  // 客户端应优先在最高优先级健康实例集合内做固定哈希。
+  int32 priority = 4;
+
+  // weight 是同优先级实例之间的权重。
+  // 首版客户端可以只做稳定排序，后续可用于加权一致性哈希。
+  int32 weight = 5;
+
+  // zone 是实例所在可用区、机房或部署区域。
+  string zone = 6;
+
+  // version 是服务端程序版本。
+  string version = 7;
+
+  // rule_revision 是该实例当前已经应用的全局规则水位。
+  string rule_revision = 8;
+
+  // state 是实例状态，例如 UP、DRAINING、DOWN。
+  string state = 9;
+
+  // metadata 是扩展元数据，例如 rule_checksum、grpc_host、grpc_port。
+  map<string, string> metadata = 10;
+}
+
+// ClientFrame 是客户端在 OpenSession 双向流中发送的统一帧。
+message ClientFrame {
+  // session_id 是本次长连接会话 ID，由客户端生成并在同一条流内保持稳定。
+  string session_id = 1;
+
+  // client_id 是客户端进程或 SDK 实例 ID。
+  string client_id = 2;
+
+  // application_code 是当前业务应用编码。
+  string application_code = 3;
+
+  // payload 是客户端帧载荷。
+  // hello 应是流建立后的第一帧；heartbeat、rule_digest、ack 可在会话生命周期内持续发送。
+  oneof payload {
+    // hello 表示客户端会话初始化信息。
+    ClientHello hello = 10;
+
+    // heartbeat 表示客户端心跳。
+    ClientHeartbeat heartbeat = 11;
+
+    // rule_digest 表示客户端当前持有的规则 digest 集合。
+    ClientRuleDigest rule_digest = 12;
+
+    // ack 表示客户端对服务端通知的确认。
+    ClientAck ack = 13;
+  }
+}
+
+// ServerFrame 是服务端在 OpenSession 双向流中发送的统一帧。
+message ServerFrame {
+  // session_id 对应客户端传入的会话 ID。
+  string session_id = 1;
+
+  // server_instance_id 是当前处理该长连接的服务端实例 ID。
+  string server_instance_id = 2;
+
+  // payload 是服务端帧载荷。
+  oneof payload {
+    // hello 表示服务端接受会话后的初始化响应。
+    ServerHello hello = 10;
+
+    // heartbeat 表示服务端心跳。
+    ServerHeartbeat heartbeat = 11;
+
+    // rule_changed 表示服务端发现客户端规则水位与服务端不一致。
+    ServerRuleChanged rule_changed = 12;
+
+    // drain 表示服务端即将下线或希望客户端迁移连接。
+    ServerDrain drain = 13;
+
+    // error 表示服务端处理客户端帧时发现协议或运行期错误。
+    ServerError error = 14;
+  }
+}
+
+// ClientHello 是客户端建立会话时发送的初始化信息。
+message ClientHello {
+  // protocol_version 是客户端希望使用的协议版本。
+  string protocol_version = 1;
+
+  // sdk_version 是客户端 SDK 版本，便于兼容性诊断。
+  string sdk_version = 2;
+
+  // application_code 是当前业务应用编码。
+  string application_code = 3;
+
+  // client_id 是客户端进程或 SDK 实例 ID。
+  string client_id = 4;
+
+  // selected_instance_id 是客户端通过固定哈希选中的服务端实例 ID。
+  // 服务端可用它校验客户端是否连接到了预期实例。
+  string selected_instance_id = 5;
+
+  // rule_digests 是客户端当前已加载的规则摘要集合。
+  // 服务端可在 hello 响应阶段直接判断是否需要客户端重新同步规则。
+  repeated RuleDigest rule_digests = 6;
+}
+
+// ServerHello 是服务端接受会话后的初始化响应。
+message ServerHello {
+  // protocol_version 是服务端最终确认使用的协议版本。
+  string protocol_version = 1;
+
+  // server_instance_id 是当前服务端实例 ID。
+  string server_instance_id = 2;
+
+  // global_rule_revision 是服务端当前全局规则水位。
+  string global_rule_revision = 3;
+
+  // rule_digests 是服务端当前应用维度的规则摘要集合。
+  repeated RuleDigest rule_digests = 4;
+
+  // heartbeat_interval_ms 是服务端建议客户端发送心跳的间隔，单位毫秒。
+  int64 heartbeat_interval_ms = 5;
+}
+
+// ClientHeartbeat 是客户端心跳。
+message ClientHeartbeat {
+  // sent_at_unix_ms 是客户端发送心跳的时间，Unix 毫秒。
+  int64 sent_at_unix_ms = 1;
+
+  // last_seen_server_rule_revision 是客户端最近一次看到的服务端规则水位。
+  string last_seen_server_rule_revision = 2;
+}
+
+// ServerHeartbeat 是服务端心跳。
+message ServerHeartbeat {
+  // sent_at_unix_ms 是服务端发送心跳的时间，Unix 毫秒。
+  int64 sent_at_unix_ms = 1;
+
+  // global_rule_revision 是服务端当前全局规则水位。
+  string global_rule_revision = 2;
+}
+
+// ClientRuleDigest 是客户端上报的规则摘要集合。
+message ClientRuleDigest {
+  // rule_digests 是客户端当前持有的规则 digest。
+  repeated RuleDigest rule_digests = 1;
+}
+
+// ServerRuleChanged 是服务端通知客户端规则发生变化或规则不一致。
+message ServerRuleChanged {
+  // global_rule_revision 是服务端当前全局规则水位。
+  string global_rule_revision = 1;
+
+  // changed_rules 是服务端认为需要客户端关注的规则 digest。
+  // 其中可能包括服务端已更新、客户端缺失、客户端冲突的规则。
+  repeated RuleDigest changed_rules = 2;
+
+  // requires_client_resync 表示客户端是否需要主动重新同步规则。
+  // true 时客户端应优先从配置中心或 GetRuleSnapshot 拉取最新规则。
+  bool requires_client_resync = 3;
+}
+
+// ClientAck 是客户端对服务端通知的确认帧。
+message ClientAck {
+  // ack_id 是确认 ID，可对应服务端通知 ID 或客户端自定义 ID。
+  string ack_id = 1;
+
+  // ack_type 是确认类型，例如 rule_changed、drain、error。
+  string ack_type = 2;
+
+  // revision 是客户端确认时已经处理到的规则水位。
+  string revision = 3;
+
+  // message 是可选说明文本，主要用于诊断。
+  string message = 4;
+}
+
+// ServerDrain 是服务端要求客户端迁移连接的通知。
+message ServerDrain {
+  // reason 是 drain 原因，例如 shutdown、rebalance、overloaded。
+  string reason = 1;
+
+  // deadline_unix_ms 是客户端应完成迁移的截止时间，Unix 毫秒。
+  int64 deadline_unix_ms = 2;
+
+  // preferred_instances 是服务端建议客户端迁移到的目标实例列表。
+  repeated PulsarInstance preferred_instances = 3;
+}
+
+// ServerError 是服务端在长连接内返回的错误信息。
+message ServerError {
+  // code 是稳定的机器可读错误码。
+  string code = 1;
+
+  // message 是面向日志和诊断的错误说明。
+  string message = 2;
+
+  // retry_after_ms 是建议客户端重试等待时间，单位毫秒。
+  int64 retry_after_ms = 3;
+}
+
+// AcquireQuotaRequest 是客户端获取限流配额的请求。
+message AcquireQuotaRequest {
+  // request_id 是客户端生成的请求 ID，用于日志追踪和排障。
+  string request_id = 1;
+
+  // application_code 是当前业务应用编码。
+  string application_code = 2;
+
+  // client_id 是客户端进程或 SDK 实例 ID。
+  string client_id = 3;
+
+  // rule_id 是客户端本地命中的限流规则 ID。
+  string rule_id = 4;
+
+  // quota_key 是本次配额扣减的限流维度 key。
+  // 推荐由租户、接口、用户、资源等业务维度稳定拼接生成。
+  string quota_key = 5;
+
+  // cost 是本次请求消耗的配额数量，必须大于 0。
+  // 未设置时服务端可按 1 处理。
+  int64 cost = 6;
+
+  // rule_revision 是客户端本地规则版本。
+  // 服务端会与内存规则版本比较，判断客户端是否落后或服务端是否滞后。
+  string rule_revision = 7;
+
+  // rule_checksum 是客户端本地规则内容摘要。
+  // 服务端会与内存规则 checksum 比较，发现同版本内容冲突。
+  string rule_checksum = 8;
+
+  // attributes 是可选请求属性，例如 route、method、tenant、region。
+  // 首版服务端可只透传记录，后续可参与规则条件匹配。
+  map<string, string> attributes = 9;
+
+  // topology_revision 是客户端用于计算 target_instance_id 的拓扑版本。
+  // 它来自 ListInstancesResponse.instance_revision。
+  string topology_revision = 10;
+
+  // target_instance_id 是客户端基于 shard key 和 topology_revision 计算出的目标 owner。
+  // 服务端会二次校验，当前实例不是 owner 时返回 NOT_OWNER。
+  string target_instance_id = 11;
+
+  // shard_hash 是客户端计算出的 shard hash，可选，用于服务端诊断 SDK hash 实现是否一致。
+  string shard_hash = 12;
+}
+
+// AcquireQuotaResponse 是服务端配额判定结果。
+message AcquireQuotaResponse {
+  // request_id 原样返回客户端请求 ID。
+  string request_id = 1;
+
+  // decision 是配额判定结果。
+  // 只有 ALLOWED 表示扣减成功；DENIED 表示规则一致但配额不足；
+  // RULE_STALE、SERVER_RULE_LAG、RULE_CONFLICT、RULE_NOT_FOUND 都表示规则状态问题。
+  QuotaDecision decision = 2;
+
+  // rule_id 是服务端参与判定的规则 ID。
+  string rule_id = 3;
+
+  // rule_revision 是服务端当前规则版本。
+  string rule_revision = 4;
+
+  // rule_checksum 是服务端当前规则 checksum。
+  string rule_checksum = 5;
+
+  // remaining 是本地窗口内剩余配额。
+  int64 remaining = 6;
+
+  // reset_at_unix_ms 是当前配额窗口重置时间，Unix 毫秒。
+  int64 reset_at_unix_ms = 7;
+
+  // retry_after_ms 是建议客户端等待多久后重试，单位毫秒。
+  // 常用于 DENIED 或 SERVER_RULE_LAG。
+  int64 retry_after_ms = 8;
+
+  // reason 是稳定的诊断原因，例如 allowed、rate_limited、rule_checksum_conflict。
+  string reason = 9;
+
+  // topology_revision 是服务端当前接受的拓扑版本。
+  // 客户端收到 NOT_OWNER 或 SHARD_MIGRATING 时应使用该值刷新本地拓扑。
+  string topology_revision = 10;
+
+  // owner_instance 是服务端计算出的 shard owner。
+  // 当 decision 为 NOT_OWNER 时，客户端应优先重试该实例。
+  PulsarInstance owner_instance = 11;
+
+  // hash_algorithm 是服务端使用的 owner 计算算法。
+  string hash_algorithm = 12;
+}
+
+// GetRuleSnapshotRequest 是客户端拉取服务端规则快照的请求。
+message GetRuleSnapshotRequest {
+  // application_code 是要查询的应用编码。
+  string application_code = 1;
+
+  // rule_ids 是可选规则 ID 列表。
+  // 为空时返回该应用下服务端当前持有的全部限流规则。
+  repeated string rule_ids = 2;
+
+  // known_revision 是客户端已知规则水位。
+  // 服务端首版可忽略，后续可用于无变化快速返回。
+  string known_revision = 3;
+}
+
+// GetRuleSnapshotResponse 是服务端返回的规则快照。
+message GetRuleSnapshotResponse {
+  // application_code 是响应对应的应用编码。
+  string application_code = 1;
+
+  // revision 是服务端全局规则水位。
+  string revision = 2;
+
+  // checksum 是服务端全局规则 checksum。
+  string checksum = 3;
+
+  // rules 是本次返回的限流规则列表。
+  repeated RateLimitRule rules = 4;
+}
+
+// ValidateRuleSnapshotRequest 是客户端校验规则 digest 的请求。
+message ValidateRuleSnapshotRequest {
+  // application_code 是当前业务应用编码。
+  string application_code = 1;
+
+  // rule_digests 是客户端当前持有的规则摘要集合。
+  repeated RuleDigest rule_digests = 2;
+}
+
+// ValidateRuleSnapshotResponse 是规则 digest 校验结果。
+message ValidateRuleSnapshotResponse {
+  // application_code 是响应对应的应用编码。
+  string application_code = 1;
+
+  // status 是整体校验状态。
+  // 如果任一规则冲突，整体状态应为 CONFLICT；如果任一规则缺失，整体状态可为 NOT_FOUND。
+  RuleValidationStatus status = 2;
+
+  // results 是每条规则 digest 的明细校验结果。
+  repeated RuleValidationResult results = 3;
+}
+
+// RuleDigest 是规则轻量摘要，用于版本比较和冲突判断。
+message RuleDigest {
+  // application_code 是规则所属应用编码。
+  string application_code = 1;
+
+  // rule_id 是限流规则 ID。
+  string rule_id = 2;
+
+  // revision 是规则版本，通常来自 StellOrbit snapshotVersion。
+  string revision = 3;
+
+  // checksum 是规则内容摘要。
+  string checksum = 4;
+
+  // schema_version 是规则内容 schema 版本。
+  string schema_version = 5;
+}
+
+// RuleValidationResult 是单条规则 digest 的校验明细。
+message RuleValidationResult {
+  // client_digest 是客户端提交的规则摘要。
+  RuleDigest client_digest = 1;
+
+  // server_digest 是服务端当前规则摘要。
+  // 如果服务端不存在该规则，该字段可以为空。
+  RuleDigest server_digest = 2;
+
+  // status 是该规则的校验状态。
+  RuleValidationStatus status = 3;
+
+  // message 是诊断说明，例如 matched、client_rule_stale、rule_checksum_conflict。
+  string message = 4;
+}
+
+// RateLimitRule 是服务端暴露给客户端的限流规则运行时视图。
+//
+// 它不是 StellOrbit 原始发布 payload 的完整替代品，
+// 只承载客户端与 StellPulsar 服务端交互所需的核心运行时字段。
+message RateLimitRule {
+  // application_code 是规则所属应用编码。
+  string application_code = 1;
+
+  // rule_id 是限流规则 ID。
+  string rule_id = 2;
+
+  // name 是规则名称。
+  string name = 3;
+
+  // revision 是规则版本，通常来自 StellOrbit snapshotVersion。
+  string revision = 4;
+
+  // checksum 是规则内容摘要。
+  string checksum = 5;
+
+  // schema_version 是规则内容 schema 版本。
+  string schema_version = 6;
+
+  // algorithm 是限流算法，例如 fixed_window、token_bucket、sliding_window。
+  string algorithm = 7;
+
+  // quota 是每个窗口允许的配额数量。
+  int64 quota = 8;
+
+  // window_seconds 是配额窗口长度，单位秒。
+  int64 window_seconds = 9;
+
+  // burst 是允许的突发配额。
+  // 对不支持突发的算法可为 0。
+  int64 burst = 10;
+
+  // dimensions 是规则匹配和配额 key 组成维度，例如 tenant、route、method。
+  repeated string dimensions = 11;
+
+  // fail_policy 是规则异常时客户端或服务端的降级策略，例如 fail_open、fail_closed。
+  string fail_policy = 12;
+
+  // attributes 是扩展属性，用于承载策略标签或后续兼容字段。
+  map<string, string> attributes = 13;
+}
+
+// QuotaDecision 是配额判定结果枚举。
+enum QuotaDecision {
+  // 未指定状态，正常服务端响应不应返回该值。
+  QUOTA_DECISION_UNSPECIFIED = 0;
+
+  // 配额允许，本次请求已经扣减成功。
+  QUOTA_DECISION_ALLOWED = 1;
+
+  // 配额拒绝，规则一致但当前窗口剩余配额不足。
+  QUOTA_DECISION_DENIED = 2;
+
+  // 客户端规则落后于服务端规则。
+  // 客户端应尽快从配置中心或服务端快照更新规则。
+  QUOTA_DECISION_RULE_STALE = 3;
+
+  // 服务端规则落后于客户端规则。
+  // 通常表示配置中心已经下发给客户端，但服务端还未 watch 到或增量还未应用。
+  QUOTA_DECISION_SERVER_RULE_LAG = 4;
+
+  // 客户端和服务端的规则 checksum 不一致。
+  // 客户端应调用 ValidateRuleSnapshot 或 GetRuleSnapshot 诊断差异。
+  QUOTA_DECISION_RULE_CONFLICT = 5;
+
+  // 服务端不存在客户端请求的规则。
+  QUOTA_DECISION_RULE_NOT_FOUND = 6;
+
+  // 请求参数非法，例如 application_code、rule_id、quota_key、rule_revision 或 rule_checksum 缺失。
+  QUOTA_DECISION_INVALID_REQUEST = 7;
+
+  // 当前服务端不是该 quota shard 的 owner，本次请求未扣减。
+  // 客户端应使用响应中的 owner_instance 重试。
+  QUOTA_DECISION_NOT_OWNER = 8;
+
+  // quota shard 正在迁移，本次请求未扣减。
+  // 客户端应按 retry_after_ms 退避后重试。
+  QUOTA_DECISION_SHARD_MIGRATING = 9;
+}
+
+// RuleValidationStatus 是规则摘要校验状态枚举。
+enum RuleValidationStatus {
+  // 未指定状态，正常服务端响应不应返回该值。
+  RULE_VALIDATION_STATUS_UNSPECIFIED = 0;
+
+  // 客户端规则 digest 与服务端一致。
+  RULE_VALIDATION_STATUS_MATCHED = 1;
+
+  // 客户端规则版本落后于服务端。
+  RULE_VALIDATION_STATUS_CLIENT_STALE = 2;
+
+  // 服务端规则版本落后于客户端。
+  RULE_VALIDATION_STATUS_SERVER_STALE = 3;
+
+  // 客户端和服务端版本或 checksum 冲突。
+  RULE_VALIDATION_STATUS_CONFLICT = 4;
+
+  // 服务端未找到客户端提交的规则。
+  RULE_VALIDATION_STATUS_NOT_FOUND = 5;
+}
