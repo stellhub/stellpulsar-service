@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  BINARY_NAME: stellpulsar-service
+  CONFIG_SOURCE: cmd/application.yaml
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test ./...
+
+  package:
+    name: Package ${{ matrix.goos }}-${{ matrix.goarch }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            binary_ext: ""
+            package_ext: tar.gz
+          - goos: windows
+            goarch: amd64
+            binary_ext: ".exe"
+            package_ext: zip
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          package_dir="dist/package"
+          mkdir -p "${package_dir}"
+          go build -trimpath -ldflags="-s -w" -o "${package_dir}/${BINARY_NAME}${{ matrix.binary_ext }}" ./cmd
+          cp "${CONFIG_SOURCE}" "${package_dir}/application.yaml"
+
+      - name: Create archive
+        run: |
+          set -euo pipefail
+          asset_name="${BINARY_NAME}-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.package_ext }}"
+          mkdir -p dist/assets
+          if [ "${{ matrix.package_ext }}" = "tar.gz" ]; then
+            tar -C dist/package -czf "dist/assets/${asset_name}" .
+          else
+            (cd dist/package && zip -r "../assets/${asset_name}" .)
+          fi
+          ls -lh "dist/assets/${asset_name}"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: package
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/release-assets
+          merge-multiple: true
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/release-assets/*.tar.gz
+            dist/release-assets/*.zip
